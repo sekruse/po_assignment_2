@@ -2,12 +2,31 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 // Modification: Added for measuring times.
 #include "../measure.h"
 
 // draws a mandelbrot fractal
 // compile with gcc fractal.c -lm -std=c99 -o fractal
+
+#define NUM_THREADS 2
+#define NUM_WORK_ITEMS 100
+
+typedef struct
+{
+    int start_row, end_row;
+} work_item;
+
+typedef struct
+{
+    float width, height;
+    unsigned int *pixmap;
+    int* counter;
+    pthread_mutex_t* counter_lock;
+    work_item* work_items;
+} mandelbrot_args;
+
 
 int pal[256] = {
     0xb2000a,0xb20009,0xb2000a,0xb1000a,0xb1000b,0xaf000d,0xaf000e,0xae000f,0xad0011,0xac0012,0xab0013,0xaa0015,
@@ -33,41 +52,118 @@ int pal[256] = {
     0xf6ff,0xf7ff,0xf8ff,0xfaff,0xfbff,0xfcff,0xfcff,0xfcff,0xfcff,0xfcff,
     0xfcff,0xfcff,0xfcff,0xfcff,0xfcff,0xfcff,0xfcff,0xfcff,0xfcff};
 
-void mandelbrot(float width, float height, unsigned int *pixmap)
+void mandelbrot_thread(void *args)
 {
-	int i, j;
+    mandelbrot_args *margs = args;
+    float height = margs->height;
+    float width = margs->width;
+    unsigned int *pixmap = margs->pixmap;
+	int i, j, start_row, end_row, work_item_index;
+    int num_items = 0;
 	float xmin = -1.6f;
 	float xmax = 1.6f;
 	float ymin = -1.6f;
 	float ymax = 1.6f;
-	for (i = 0; i < height; i++) {
-		for (j = 0; j < width; j++) {
-			float b = xmin + j * (xmax - xmin) / width;
-			float a = ymin + i * (ymax - ymin) / height;
-			float sx = 0.0f;
-			float sy = 0.0f;
-			int ii = 0;
-			while (sx + sy <= 64.0f) {
-				float xn = sx * sx - sy * sy + b;
-				float yn = 2 * sx * sy + a;
-				sx = xn;
-				sy = yn;
-				ii++;
-				if (ii == 1500)	{
-					break;
-				}
-			}
-			if (ii == 1500)	{
-				pixmap[j+i*(int)width] = 0;
-			}
-			else {
-				int c = (int)((ii / 32.0f) * 256.0f);
-				pixmap[j + i *(int)width] = pal[c%256];
-			}
-		}
+    clock_t a, b;
+
+    a = 0;
+    while (1)
+    {
+        // Try to get a work item.
+        b = clock();
+        pthread_mutex_lock(margs->counter_lock);
+        a += clock() - b;
+        work_item_index = --(*(margs->counter));
+        pthread_mutex_unlock(margs->counter_lock);
+        if (work_item_index < 0) break;
+        start_row = margs->work_items[work_item_index].start_row;
+        end_row = margs->work_items[work_item_index].end_row;
+        num_items++;
+
+        // Process the work item.
+	    for (i = start_row; i < end_row; i++) {
+		    for (j = 0; j < width; j++) {
+			    float b = xmin + j * (xmax - xmin) / width;
+			    float a = ymin + i * (ymax - ymin) / height;
+			    float sx = 0.0f;
+			    float sy = 0.0f;
+			    int ii = 0;
+			    while (sx + sy <= 64.0f) {
+				    float xn = sx * sx - sy * sy + b;
+				    float yn = 2 * sx * sy + a;
+				    sx = xn;
+				    sy = yn;
+				    ii++;
+				    if (ii == 1500)	{
+					    break;
+				    }
+			    }
+			    if (ii == 1500)	{
+				    pixmap[j+i*(int)width] = 0;
+			    }
+			    else {
+				    int c = (int)((ii / 32.0f) * 256.0f);
+				    pixmap[j + i *(int)width] = pal[c%256];
+			    }
+		    }
+        }
 	}
 
+    printf("Thread processed %d work items.\n", num_items);
+    printf("Waited %.3f secs, %ld ticks\n", ((float)a) / CLOCKS_PER_SEC, a);
+    pthread_exit(0);
+}
 
+void* mandelbrot(float height, float width, unsigned int* pixmap)
+{
+    // Initialize arguments.
+    int d_row = ((int)height + NUM_WORK_ITEMS - 1) / NUM_WORK_ITEMS;
+    int start_row, end_row;
+
+    int* counter = (int*) malloc(sizeof(int));
+    work_item* work_items = (work_item*) malloc(sizeof(work_item) * NUM_WORK_ITEMS);
+    pthread_mutex_t* counter_lock = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t));
+    mandelbrot_args* thread_args = (mandelbrot_args*) malloc(sizeof(mandelbrot_args));
+    
+    pthread_t threads[NUM_THREADS];
+    pthread_attr_t thread_attr;
+    int i;
+
+    // Prepare the work items.
+    pthread_mutex_init(counter_lock, NULL);
+    end_row = 0;
+    *counter = 0;
+    while (end_row < height)
+    {
+        start_row = end_row;
+        end_row += d_row;
+        if (end_row > height) end_row = height;
+        work_items[*counter].start_row = start_row;
+        work_items[*counter].end_row = end_row;
+        (*counter)++;        
+    }
+
+    // Prepare the thread arguments.
+    thread_args->height = height;
+    thread_args->width = width;
+    thread_args->pixmap = pixmap;
+    thread_args->counter = counter;
+    thread_args->counter_lock = counter_lock;
+    thread_args->work_items = work_items;
+
+    // Start the threads.
+    pthread_attr_init(&thread_attr);
+    for (i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_create(&threads[i], &thread_attr, mandelbrot_thread, (void*) thread_args);
+    }
+
+    // Wait for the threads to finish.
+    for (i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+        
 }
 
 void writetga(unsigned int *pixmap, unsigned int width, unsigned int height, char *name)

@@ -11,6 +11,5 @@ void start_timer()
 void stop_timer(char* message)
 {
     counter = clock() - counter;
-    printf("%s\n", message);
-    printf("\tExecution time: %.3f secs\n", ((float)counter) / CLOCKS_PER_SEC);
+    printf("%s\tExecution time: %.3f secs\n", message, ((float)counter) / CLOCKS_PER_SEC);
 }
